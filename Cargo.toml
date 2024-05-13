@@ -4,3 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+lexopt = "0.3.0"
+toml = "0.8.12"
+socket2 = { version = "0.5.7", features = ["all"] }
+serde = { version = "1.0", features = ["derive"] }
+# Required by socket2, because of incomplete interface
+# Minimum version, as derived from socket2 0.5.7, with restricted
+# compatibility range
+libc = "~0.2.150"

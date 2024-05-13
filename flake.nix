@@ -66,6 +66,7 @@
           # Software directly available inside the developer shell
           packages = [
             pkgs.git
+            pkgs.nixpkgs-fmt
             pkgs.rust-analyzer # from overlay
             # In case nightly is needed, use this;
             # pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.default)
