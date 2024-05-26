@@ -1,11 +1,20 @@
 {
-    "[nix]": {
-      "editor.formatOnSave": true,
-      "editor.defaultFormatter": "jnoortheen.nix-ide"
-    },
-    "nix.enableLanguageServer": false, // Language server integration TODO
-    "nix.formatterPath": "nixpkgs-fmt",
-    "rust-analyzer.files.excludeDirs": [
-      ".direnv"
-    ],    
+  //"git.enabled": false,
+  "git.terminalAuthentication": false,
+  // STOP FUCKING WITH MY SSH PASSTHROUGH MF'ERS
+  "terminal.integrated.persistentSessionReviveProcess": "never",
+  "terminal.integrated.enablePersistentSessions": false,
+  "[nix]": {
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "jnoortheen.nix-ide"
+  },
+  "nix.enableLanguageServer": false, // Language server integration TODO
+  "nix.formatterPath": "nixpkgs-fmt",
+  // The project uses direnv, and rust-analyzer by default exec's its executables.
+  // A VS Code extension or rust-analyzer wrapper is required to have the correct
+  // dependencies on PATH before invoking the executable.
+  "rust-analyzer.server.path": "${workspaceFolder}/rust-analyzer-wrapper.sh",
+  "rust-analyzer.files.excludeDirs": [
+    ".direnv"
+  ],
 }
