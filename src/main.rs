@@ -1,3 +1,42 @@
+const HELP: &str = "\
+bss [--port <u32>] [--timeout <u32>] [--help] [COMMAND] MANIFEST_FILE_PATH
+
+OPTIONS:
+    --vsock-address <TODO>
+    --unix-socket   <TODO>
+    --ip-address    <TODO>
+    -p, --port      The port number to listen/connect to. (Default {})
+
+    -t, --timeout   The amount of seconds to block waiting until a succesful connection is setup between sender and receiver. (Default {})
+    -b, --bytes-max The per-transferred-file maximum byte size limit. (Default {})
+    --help          Print this help message and exit.
+
+COMMANDS:
+    send        Connects to another process started with subcommand 'receive' to send files according to the manifest.
+
+    receive     Opens a new socket to receive and store files according to the manifest.
+
+NOTE: The connection addresses are tried in the order VSOCK network > UNIX socket > IP network. The first argument provided in that order will be used for creating a connection.
+ERROR: UNIX sockets will not work on non-UNIX operating systems.
+";
+
+// TODO Constants
+
+// A port that requires CAP_NET_ADMIN to bind to, because the datastream
+// will contain sensitive material.
+//
+// The port can be set to another value, please do so when you understand
+// the threat model of leaking sensitive secrets.
+const DEFAULT_LISTEN_ADDRESS: u32 = 21;
+
+// A default connect timeout because everything needs a lifetime.
+// The value is in unit seconds.
+const DEFAULT_TIMEOUT: u32 = 3600;
+
+// A default for the maximum filesize to transfer. Security measure to protect
+// the receive side.
+const DEFAULT_MAX_TRASMISSION_BYTES: u32 = 1024 * 1024;
+
 type StateType = ();
 
 #[derive(serde::Deserialize, Debug)]
@@ -15,61 +54,79 @@ struct Secret {
     mode: String,
 }
 
-
-#[derive(Debug)]
-struct CreateIOFail;
-impl warp::reject::Reject for CreateIOFail {}
-
-#[derive(Debug)]
-struct WriteIOFail;
-impl warp::reject::Reject for WriteIOFail {}
-
-#[cfg(not(unix))]
-#[tokio::main]
-async fn main() {
-    panic!("Must run under Unix-like platform!");
+struct GlobalSettings {
+    timeout_seconds: u32,
+    socket_port: u32,
+    max_transmission_bytes: u32,
 }
 
+// Implements the receive side, aka the HTTP (and connection) server.
+mod receive;
+
+// Implements the send side, aka the HTTP client.
+mod send;
+
 #[cfg(unix)]
-#[tokio::main]
-async fn main() {
-    use tokio::net::UnixListener;
-    use tokio_stream::wrappers::UnixListenerStream;
-    use warp::Filter;
+// Implements unix sockets as underlying transport mechanism.
+mod unix_socket;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use lexopt::prelude::*;
 
     pretty_env_logger::init();
 
-    // TODO parametrize max request body
-    let config_max_body_size = 1024 * 16;
+    let mut settings = GlobalSettings {
+        timeout_seconds: DEFAULT_TIMEOUT,
+        socket_port: DEFAULT_LISTEN_ADDRESS,
+        max_transmission_bytes: DEFAULT_MAX_TRASMISSION_BYTES,
+    };
 
-    let manifest: &'static _ = read_and_deserialize_manifest();
-    let manifest_tracker = std::sync::Arc::new(());
+    let mut parser = lexopt::Parser::from_env();
+    while let Some(token) = parser.next()? {
+        match token {
+            Short('h') | Long("help") => {
+                println!("{}", HELP);
+                std::process::exit(0);
+            }
+            Short('t') | Long("timeout") => {
+                settings.timeout_seconds = parser.value()?.parse()?;
+            }
+            Short('p') | Long("port") => {
+                settings.socket_port = parser.value()?.parse()?;
+            }
+            Short('b') | Long("bytes-max") => {
+                settings.max_transmission_bytes = parser.value()?.parse()?;
+            }
+            Value(value) => {
+                let value = value.string()?;
+                match value.as_str() {
+                    "receive" => {
+                        return receive::server_main(settings, parser);
+                    }
+                    "send" => {
+                        return send::client_main(settings, parser);
+                    }
+                    value => {
+                        return Err(format!("unknown subcommand '{}'", value).into());
+                    }
+                }
+            }
+            _ => return Err(token.unexpected())?,
+        }
+    }
 
-    let listener = UnixListener::bind("/tmp/warp.sock").unwrap();
-    let incoming = UnixListenerStream::new(listener);
-
-    // Wrap data for injecting into route handlers
-    let state = warp::any().map(move || (manifest, manifest_tracker.clone()));
-
-    // POST /secrets/:name  <binary data>
-    let upload_route = warp::post()
-        .and(warp::path("secrets"))
-        .and(warp::path::param())
-        .and(warp::body::content_length_limit(config_max_body_size))
-        .and(warp::body::stream())
-        .and(state)
-        .and_then(upload);
-
-    let router = upload_route.recover(handle_rejection);
-    warp::serve(router).run_incoming(incoming).await;
+    println!("{}", HELP);
+    Ok(())
 }
 
-fn read_and_deserialize_manifest() -> &'static mut Manifest {
+fn read_and_deserialize_manifest(_path: std::path::PathBuf) -> &'static mut Manifest {
+    // TODO Actually parse provided manifest
+
     let example_manifest = Manifest {
         secrets: vec![Secret {
             name: "test".to_string(),
             source_path: std::path::PathBuf::from(r"/tmp/source"),
-            destination_path: std::path::PathBuf::from(r"/tmp/source"),
+            destination_path: std::path::PathBuf::from(r"/tmp/target"),
             owner: "bert-proesmans".to_string(),
             group: "bert-proesmans".to_string(),
             mode: "0664".to_string(),
@@ -77,73 +134,4 @@ fn read_and_deserialize_manifest() -> &'static mut Manifest {
     };
 
     Box::leak(Box::new(example_manifest))
-}
-
-async fn upload(
-    tag: String,
-    file_body: impl futures::Stream<Item = Result<impl warp::Buf, warp::Error>> + Unpin,
-    (manifest, _tracker): (&'static Manifest, std::sync::Arc<StateType>),
-) -> Result<impl warp::reply::Reply, warp::reject::Rejection> {
-    
-    // TODO Verify with state
-    let secret = match manifest.secrets.iter().find(|&item| item.name == tag) {
-        Some(secret) => secret,
-        None => return Err(warp::reject::not_found())
-    };
-    
-    // TODO Resolve physical destination node
-    let target_file_path = &secret.destination_path;
-    
-    // Open the file in write mode
-    let mut target_file_handle = match tokio::fs::File::create(target_file_path).await {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("Failed to create file: {}", e);
-            return Err(warp::reject::custom(CreateIOFail));
-        }
-    };
-    
-    // Use StreamExt to map the stream and error to a std::io::Error, tokio::io::copy* methods
-    // require the stream elements to error with std::io::Error type.
-    use tokio_stream::StreamExt;
-    let file_body = file_body.map(|result| result.map_err(|err| {
-        std::io::Error::new(std::io::ErrorKind::Other, err)
-    }));
-    let mut file_body = tokio_util::io::StreamReader::new(file_body);
-    
-    // TODO Shutdown stream if receiving data takes too long
-    let _bytes_written = match tokio::io::copy_buf(&mut file_body, &mut target_file_handle).await {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("Failed writing to file: {}", e);
-            return Err(warp::reject::custom(WriteIOFail));
-        }
-    };
-
-    // TODO Update state
-
-    // TODO Signal shutdown
-    // shutdown_signal.send(()).await?;
-    
-    Ok(warp::http::StatusCode::CREATED)
-}
-
-async fn handle_rejection(
-    err: warp::reject::Rejection,
-) -> std::result::Result<impl warp::reply::Reply, std::convert::Infallible> {
-    use warp::http::StatusCode;
-
-    let (code, message) = if err.is_not_found() {
-        (StatusCode::NOT_FOUND, "Not Found".to_string())
-    } else if err.find::<warp::reject::PayloadTooLarge>().is_some() {
-        (StatusCode::BAD_REQUEST, "Payload too large".to_string())
-    } else {
-        eprintln!("unhandled error: {:?}", err);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal Server Error".to_string(),
-        )
-    };
-
-    Ok(warp::reply::with_status(message, code))
 }
